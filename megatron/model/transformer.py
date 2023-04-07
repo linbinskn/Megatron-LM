@@ -461,14 +461,36 @@ class ParallelAttention(MegatronModule):
 
         return hidden_states
 
-    def _allocate_memory(self, inference_max_sequence_len, batch_size):
-        return torch.empty(
-            inference_max_sequence_len,
-            batch_size,
-            self.num_attention_heads_per_partition,
-            self.hidden_size_per_attention_head,
-            dtype=self.params_dtype,
-            device=torch.cuda.current_device())
+    def _allocate_memory(self, inference_max_sequence_len, batch_size, kv_cache_quant=False):
+        if kv_cache_quant == False:
+            all_size = inference_max_sequence_len * batch_size * self.num_attention_heads_per_partition * self.hidden_size_per_attention_head
+            # print(f"allocate kv cache size: {all_size}")
+            return torch.empty(
+                inference_max_sequence_len,
+                batch_size,
+                self.num_attention_heads_per_partition,
+                self.hidden_size_per_attention_head,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device())
+        else:
+            # allocate int8 type memory space
+            return torch.empty(
+                inference_max_sequence_len,
+                batch_size,
+                self.num_attention_heads_per_partition,
+                self.hidden_size_per_attention_head,
+                dtype=torch.int8,
+                device=torch.cuda.current_device())
+
+    # current only support int8
+    def kv_tensor_quant(self, tensor):
+        tensor_scale = (tensor.abs().view(tensor.size(0),tensor.size(1), -1)).max(dim=-1).values / 128
+        tensor = torch.round(tensor / tensor_scale[:, :, None, None])
+        tensor = torch.clip(tensor, -128, 127).to(torch.int8)
+        return tensor, tensor_scale
+
+    def kv_tensor_dequant(self, tensor, tensor_scale):
+        return (tensor * tensor_scale[:, :, None, None]).half()
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_params=None):
@@ -482,15 +504,40 @@ class ParallelAttention(MegatronModule):
             if self.layer_number not in inference_params.key_value_memory_dict:
                 inf_max_seq_len = inference_params.max_sequence_len
                 inf_max_batch_size = inference_params.max_batch_size
+                # when key_value_memory_scale_dict is not None, allocate int8 type memory
                 inference_key_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size)
+                    inf_max_seq_len, inf_max_batch_size, inference_params.key_value_memory_scale_dict != None)
                 inference_value_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size)
+                    inf_max_seq_len, inf_max_batch_size, inference_params.key_value_memory_scale_dict != None)
                 inference_params.key_value_memory_dict[self.layer_number] = (
                     inference_key_memory, inference_value_memory)
             else:
                 inference_key_memory, inference_value_memory = \
                     inference_params.key_value_memory_dict[self.layer_number]
+        
+        # Allocate memory for key, value scale. Since key, value are quantized in token level
+        # their shape should be (max_seq_len, max_batch_size).
+        if inference_params and inference_params.key_value_memory_scale_dict is not None:
+            if self.layer_number not in inference_params.key_value_memory_scale_dict:
+                inf_max_seq_len = inference_params.max_sequence_len
+                inf_max_batch_size = inference_params.max_batch_size
+
+                inference_key_scale_memory = torch.empty(
+                    inf_max_seq_len,
+                    inf_max_batch_size,
+                    dtype=torch.float16,
+                    device=torch.cuda.current_device())
+                
+                inference_value_scale_memory = torch.empty(
+                    inf_max_seq_len,
+                    inf_max_batch_size,
+                    dtype=torch.float16,
+                    device=torch.cuda.current_device())
+                inference_params.key_value_memory_scale_dict[self.layer_number] = (
+                    inference_key_scale_memory, inference_value_scale_memory)
+            else:
+                inference_key_scale_memory, inference_value_scale_memory = \
+                    inference_params.key_value_memory_scale_dict[self.layer_number]
 
         # =====================
         # Query, Key, and Value
@@ -532,6 +579,13 @@ class ParallelAttention(MegatronModule):
                  self.hidden_size_per_attention_head)
             query_layer = query_layer.view(*new_tensor_shape)
 
+        # import ipdb; ipdb.set_trace()
+        
+        # dynamic quantize new generate kv cache
+        if inference_params and inference_params.key_value_memory_scale_dict is not None:
+            key_layer, key_layer_scale = self.kv_tensor_quant(key_layer)
+            value_layer, value_layer_scale = self.kv_tensor_quant(value_layer)
+
         # ==================================
         # Adjust key and value for inference
         # ==================================
@@ -552,6 +606,16 @@ class ParallelAttention(MegatronModule):
                 :sequence_end, batch_start:batch_end, ...]
             value_layer = inference_value_memory[
                 :sequence_end, batch_start:batch_end, ...]
+            
+            if inference_params.key_value_memory_scale_dict is not None:
+                inference_key_scale_memory[sequence_start:sequence_end,
+                                 batch_start:batch_end] = key_layer_scale
+                inference_value_scale_memory[sequence_start:sequence_end,
+                                   batch_start:batch_end] = value_layer_scale
+                key_layer = self.kv_tensor_dequant(key_layer, inference_key_scale_memory[:sequence_end,batch_start:batch_end])
+                value_layer = self.kv_tensor_dequant(value_layer, inference_value_scale_memory[:sequence_end,batch_start:batch_end])
+        
+        # import ipdb; ipdb.set_trace()
 
         # ==================================
         # core attention computation

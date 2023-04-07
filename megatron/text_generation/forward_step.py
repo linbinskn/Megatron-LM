@@ -18,7 +18,7 @@ class InferenceParams:
     """Inference parameters that are passed to the main model in order
     to efficienly calculate and store the context during inference."""
 
-    def __init__(self, max_batch_size, max_sequence_len):
+    def __init__(self, max_batch_size, max_sequence_len, kv_cache_quant=False):
         """Note that offsets are set to zero and we always set the
         flag to allocate memory. After the first call, make sure to
         set this flag to False."""
@@ -27,6 +27,10 @@ class InferenceParams:
         self.sequence_len_offset = 0
         self.batch_size_offset = 0
         self.key_value_memory_dict = {}
+        self.key_value_memory_scale_dict = None
+        args = get_args()
+        if args.kv_cache_quant is True:
+            self.key_value_memory_scale_dict = {}
 
     def swap_key_value_dict(self, batch_idx):
         "swap between batches"
