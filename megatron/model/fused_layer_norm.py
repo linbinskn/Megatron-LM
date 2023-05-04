@@ -106,6 +106,9 @@ class MixedFusedLayerNorm(torch.nn.Module):
 
     weight = self.weight + 1 if self.apply_layernorm_1p else self.weight
 
+    return torch.nn.functional.layer_norm(input, self.normalized_shape, weight, self.bias, self.eps)
+
+    """
     if self.no_persist_layer_norm:
         return FusedLayerNormAffineFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps)
     else:
@@ -120,3 +123,4 @@ class MixedFusedLayerNorm(torch.nn.Module):
                                       keep_graph = True)
 
         return output
+    """

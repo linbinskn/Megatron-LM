@@ -18,6 +18,12 @@ from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
+import logging
+from torch import _dynamo
+
+import os
+os.environ["AOT_FX_GRAPHS"] = "true"
+
 try:
     from einops import rearrange
 except ImportError:
@@ -27,6 +33,8 @@ try:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
 except ImportError:
     flash_attn_unpadded_func = None
+    
+torch.ops.load_library("/work/aicompiler/platform_alibaba/blade_gemm/src/torch_ops/build/libtorch_bladnn.so")
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -646,8 +654,33 @@ class ParallelAttention(MegatronModule):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+            
+        
+        attn_batch_size = query_layer.size(1)
+        attn_num_heads = query_layer.size(2)
+        
+        if query_layer.size(0) == 1:
+            query_layer = query_layer.view(
+                query_layer.size(0), query_layer.size(1) * query_layer.size(2), -1
+            )
+            key_layer = key_layer.view(
+                key_layer.size(0), key_layer.size(1) * key_layer.size(2), -1
+            )
+            value_layer = value_layer.view(
+                value_layer.size(0), value_layer.size(1) * value_layer.size(2), -1
+            )
 
-        if not self.use_flash_attn:
+            context_layer = torch.ops.torch_bladnn.bladnn_attention(
+                query_layer.contiguous(),
+                key_layer,
+                value_layer,
+                1.0,
+                attn_batch_size,
+                attn_num_heads,
+                1,
+                2,
+            )
+        elif not self.use_flash_attn:
             if self.checkpoint_core_attention:
                 context_layer = self._checkpointed_attention_forward(
                     query_layer, key_layer, value_layer, attention_mask)
@@ -695,13 +728,16 @@ def bias_dropout_add_fused_train(x: torch.Tensor,
                                  prob: float) -> torch.Tensor:
     return bias_dropout_add(x, bias, residual, prob, True)
 
-
-@torch.jit.script
 def bias_dropout_add_fused_inference(x: torch.Tensor,
                                      bias: Optional[torch.Tensor],
                                      residual: torch.Tensor,
                                      prob: float) -> torch.Tensor:
-    return bias_dropout_add(x, bias, residual, prob, False)
+    if bias is not None:
+        bias = bias.expand_as(residual)
+        x = x + bias
+    x = residual + x
+    return x
+    # return bias_dropout_add(x, bias, residual, prob, False)
 
 
 class ParallelTransformerLayer(MegatronModule):
@@ -772,7 +808,13 @@ class ParallelTransformerLayer(MegatronModule):
         if args.num_experts is not None:
             self.mlp = SwitchMLP(init_method, output_layer_init_method)
         else:
+            # x_tmp = torch.randn(1, 1, 12288,dtype=torch.float16,device="cuda")
             self.mlp = ParallelMLP(init_method, output_layer_init_method)
+            # self.mlp = torch.cuda.make_graphed_callables(self.mlp, (x_tmp,), allow_unused_input=True)
+            
+            # _dynamo.config.log_level = logging.DEBUG
+            # _dynamo.config.verbose = True
+            # self.mlp = torch.compile(self.mlp, backend="inductor")
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -815,8 +857,6 @@ class ParallelTransformerLayer(MegatronModule):
             else:
                 bias_dropout_add_func = get_bias_dropout_add(self.training)
 
-            if attention_bias is not None:
-                attention_bias = attention_bias.expand_as(residual)
             with self.bias_dropout_add_exec_handler():
                 layernorm_input = bias_dropout_add_func(
                     attention_output,
@@ -866,8 +906,6 @@ class ParallelTransformerLayer(MegatronModule):
             residual = layernorm_input
 
         if self.drop_path is None:
-            if mlp_bias is not None:
-                mlp_bias = mlp_bias.expand_as(residual)
             with self.bias_dropout_add_exec_handler():
                 output = bias_dropout_add_func(
                     mlp_output,

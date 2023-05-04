@@ -341,6 +341,7 @@ def validate_args(args, defaults={}):
     # sequence_parallelism is enabled.
     if args.tensor_model_parallel_size == 1:
         args.sequence_parallel = False
+    args.async_tensor_model_parallel_allreduce = False
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
